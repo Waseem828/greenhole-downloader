@@ -2,6 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import ytdl from '@distube/ytdl-core';
+import axios from 'axios';
 import { spawn } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -23,32 +25,17 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, 'dist')));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// yt-dlp binary path
-// Windows (local dev): node_modules yt-dlp-exec binary
-// Linux (Hostinger):   bin/yt-dlp downloaded by postinstall script
+// Path to optional yt-dlp binary if available
 const isWindows = process.platform === 'win32';
 const ytDlpBinaryPath = isWindows
   ? path.join(__dirname, 'node_modules', 'yt-dlp-exec', 'bin', 'yt-dlp.exe')
   : path.join(__dirname, 'bin', 'yt-dlp');
 
-console.log(`[Server] yt-dlp path: ${ytDlpBinaryPath}`);
-
 // Dedicated Clean HTML Page Routes
-app.get('/terms', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'terms.html'));
-});
-
-app.get('/privacy', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'privacy.html'));
-});
-
-app.get('/dmca', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'dmca.html'));
-});
-
-app.get('/about', (req, res) => {
-  res.sendFile(path.join(__dirname, 'dist', 'about.html'));
-});
+app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'terms.html')));
+app.get('/privacy', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'privacy.html')));
+app.get('/dmca', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'dmca.html')));
+app.get('/about', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'about.html')));
 
 // API Endpoint 1: Parse Video URL Details
 app.post('/api/parse', async (req, res) => {
@@ -68,41 +55,56 @@ app.post('/api/parse', async (req, res) => {
     else if (url.includes('instagram.com')) platform = 'instagram';
     else if (url.includes('facebook.com') || url.includes('fb.watch')) platform = 'facebook';
 
-    // Use spawn to run yt-dlp and get JSON metadata
-    let output = {};
-    try {
-      const jsonData = await new Promise((resolve, reject) => {
-        const args = ['--dump-single-json', '--no-warnings', '--no-call-home', url];
-        const child = spawn(ytDlpBinaryPath, args);
-        let stdout = '';
-        let stderr = '';
+    let title = `${platform.toUpperCase()} Download`;
+    let thumbnail = '/hero.jpg';
+    let author = `@${platform}_user`;
+    let duration = '03:15';
 
-        child.stdout.on('data', d => { stdout += d.toString(); });
-        child.stderr.on('data', d => { stderr += d.toString(); });
-
-        child.on('close', code => {
-          if (code === 0 && stdout) {
-            try { resolve(JSON.parse(stdout)); }
-            catch (e) { reject(new Error('JSON parse failed')); }
-          } else {
-            reject(new Error(stderr || 'yt-dlp exited with code ' + code));
+    // A. YOUTUBE PARSING via Pure JS ytdl-core & oEmbed
+    if (platform === 'youtube') {
+      try {
+        if (ytdl.validateURL(url)) {
+          const info = await ytdl.getInfo(url);
+          title = info.videoDetails.title || title;
+          thumbnail = info.videoDetails.thumbnails.pop()?.url || thumbnail;
+          author = info.videoDetails.author?.name ? `@${info.videoDetails.author.name}` : author;
+          if (info.videoDetails.lengthSeconds) {
+            duration = formatSeconds(parseInt(info.videoDetails.lengthSeconds));
           }
-        });
-
-        child.on('error', reject);
-
-        // 30 second timeout
-        setTimeout(() => { child.kill(); reject(new Error('Timeout')); }, 30000);
-      });
-      output = jsonData;
-    } catch (ytErr) {
-      console.warn(`[Parser Warning] yt-dlp fallback:`, ytErr.message);
+        } else {
+          throw new Error('Invalid YouTube URL');
+        }
+      } catch (ytErr) {
+        console.warn('[ytdl-core parse warning]:', ytErr.message);
+        // Fallback to YouTube oEmbed API
+        try {
+          const embedUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
+          const response = await axios.get(embedUrl, { timeout: 5000 });
+          if (response.data) {
+            title = response.data.title || title;
+            author = response.data.author_name ? `@${response.data.author_name}` : author;
+            thumbnail = response.data.thumbnail_url || thumbnail;
+          }
+        } catch (oembedErr) {
+          console.warn('[YouTube oEmbed warning]:', oembedErr.message);
+        }
+      }
+    } 
+    // B. TIKTOK PARSING via TikWM API
+    else if (platform === 'tiktok') {
+      try {
+        const response = await axios.get(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`, { timeout: 8000 });
+        if (response.data && response.data.data) {
+          const d = response.data.data;
+          title = d.title || title;
+          thumbnail = d.cover || d.origin_cover || thumbnail;
+          author = d.author ? `@${d.author.unique_id || d.author.nickname}` : author;
+          duration = formatSeconds(d.duration || 30);
+        }
+      } catch (ttErr) {
+        console.warn('[TikTok TikWM warning]:', ttErr.message);
+      }
     }
-
-    const title = output.title || `${platform.toUpperCase()} Download ${Date.now()}`;
-    const thumbnail = output.thumbnail || (output.thumbnails && output.thumbnails[0]?.url) || '/hero.jpg';
-    const author = output.uploader || output.channel || `@${platform}_user`;
-    const duration = output.duration ? formatSeconds(output.duration) : '03:15';
 
     const formats = [
       {
@@ -135,7 +137,15 @@ app.post('/api/parse', async (req, res) => {
       }
     ];
 
-    return res.json({ success: true, title, thumbnail, author, duration, platform, formats });
+    return res.json({
+      success: true,
+      title,
+      thumbnail,
+      author,
+      duration,
+      platform,
+      formats
+    });
 
   } catch (error) {
     console.error('[API Error /api/parse]:', error.message);
@@ -147,98 +157,112 @@ app.post('/api/parse', async (req, res) => {
 });
 
 // API Endpoint 2: Real-time Video Stream Download
-app.get('/api/download', (req, res) => {
+app.get('/api/download', async (req, res) => {
   const videoUrl = req.query.url;
   const isAudio = req.query.type === 'audio';
-  const quality = req.query.quality || 'best'; // e.g. '1080', '720', '480'
+  const quality = req.query.quality || '720';
   const customFilename = req.query.filename || `GreenHole_Download_${Date.now()}.${isAudio ? 'mp3' : 'mp4'}`;
 
   if (!videoUrl) {
     return res.status(400).send('Error: Video URL parameter is missing');
   }
 
-  console.log(`[Streamer] Quality: ${quality} | URL: ${videoUrl}`);
+  console.log(`[Streamer] Downloading: ${videoUrl} | Type: ${isAudio ? 'audio' : 'video'} | Quality: ${quality}`);
 
-  // Set HTTP headers for file attachment download
+  // Set HTTP headers for direct file download
   res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(customFilename)}"`);
   res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
-  res.setHeader('Transfer-Encoding', 'chunked');
 
-  // Build yt-dlp format string based on requested quality
-  let formatStr;
-  if (isAudio) {
-    formatStr = 'bestaudio[ext=m4a]/bestaudio';
-  } else {
-    switch (quality) {
-      case '1080':
-        formatStr = 'best[height<=1080][ext=mp4]/best[height<=1080]/bestvideo[height<=1080]+bestaudio/best';
-        break;
-      case '720':
-        formatStr = 'best[height<=720][ext=mp4]/best[height<=720]/bestvideo[height<=720]+bestaudio/best';
-        break;
-      case '480':
-        formatStr = 'best[height<=480][ext=mp4]/best[height<=480]/bestvideo[height<=480]+bestaudio/best';
-        break;
-      case '360':
-        formatStr = 'best[height<=360][ext=mp4]/best[height<=360]/best';
-        break;
-      default:
-        formatStr = 'best[ext=mp4]/best';
+  // METHOD 1: YouTube Pure JavaScript ytdl-core (No Python required!)
+  if (videoUrl.includes('youtube.com') || videoUrl.includes('youtu.be')) {
+    try {
+      if (ytdl.validateURL(videoUrl)) {
+        let filterSetting = isAudio ? 'audioonly' : 'videoandaudio';
+        let qualitySetting = 'highestvideo';
+
+        if (isAudio) {
+          qualitySetting = 'highestaudio';
+        } else {
+          if (quality === '1080') qualitySetting = 'highestvideo';
+          else if (quality === '720') qualitySetting = 'highestvideo';
+          else if (quality === '480') qualitySetting = 'lowestvideo';
+        }
+
+        const stream = ytdl(videoUrl, {
+          filter: filterSetting,
+          quality: qualitySetting,
+          highWaterMark: 1 << 25
+        });
+
+        stream.on('error', (err) => {
+          console.error('[ytdl-core Stream Error]:', err.message);
+          if (!res.headersSent) {
+            res.status(500).send('Error streaming YouTube video');
+          }
+        });
+
+        return stream.pipe(res);
+      }
+    } catch (ytdlErr) {
+      console.warn('[ytdl-core Engine Warning]:', ytdlErr.message);
     }
   }
 
-  console.log(`[Streamer] yt-dlp format: ${formatStr}`);
-
-  // Spawn yt-dlp process to stream video directly to browser
-  const args = [
-    '-f', formatStr,
-    '--no-playlist',
-    '--no-warnings',
-    '-o', '-',
-    videoUrl
-  ];
-
-  const child = spawn(ytDlpBinaryPath, args);
-
-  // Pipe yt-dlp stdout directly to HTTP response (streaming)
-  child.stdout.pipe(res);
-
-  child.stderr.on('data', (data) => {
-    const msg = data.toString();
-    // Only log actual errors, not progress info
-    if (msg.includes('ERROR') || msg.includes('error')) {
-      console.error('[yt-dlp stderr]:', msg.trim());
+  // METHOD 2: TikTok CDN Direct Stream via TikWM
+  if (videoUrl.includes('tiktok.com')) {
+    try {
+      const tikRes = await axios.get(`https://www.tikwm.com/api/?url=${encodeURIComponent(videoUrl)}`, { timeout: 8000 });
+      if (tikRes.data && tikRes.data.data) {
+        const directMediaUrl = isAudio ? tikRes.data.data.music : (tikRes.data.data.hdplay ? `https://www.tikwm.com${tikRes.data.data.hdplay}` : `https://www.tikwm.com${tikRes.data.data.play}`);
+        if (directMediaUrl) {
+          const mediaStream = await axios({
+            method: 'get',
+            url: directMediaUrl,
+            responseType: 'stream',
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+          });
+          return mediaStream.data.pipe(res);
+        }
+      }
+    } catch (tikErr) {
+      console.warn('[TikTok Stream Proxy Error]:', tikErr.message);
     }
-  });
+  }
 
-  child.on('error', (err) => {
-    console.error('[Stream Spawn Error]:', err.message);
-    if (!res.headersSent) {
-      res.status(500).send('Error: Could not start download process');
-    }
-  });
+  // METHOD 3: Fallback yt-dlp spawn (if yt-dlp binary exists on machine)
+  try {
+    let formatStr = isAudio ? 'bestaudio[ext=m4a]/bestaudio' : 'best[ext=mp4]/best';
+    const child = spawn(ytDlpBinaryPath, ['-f', formatStr, '--no-playlist', '-o', '-', videoUrl]);
+    
+    child.stdout.pipe(res);
 
-  child.on('close', (code) => {
-    console.log(`[Streamer] yt-dlp exited with code ${code}`);
-    if (code !== 0 && !res.writableEnded) {
-      res.end();
-    }
-  });
+    child.on('error', (err) => {
+      console.error('[yt-dlp spawn error]:', err.message);
+      if (!res.headersSent) res.status(500).send('Download engine unavailable');
+    });
 
-  // Handle client disconnect — kill yt-dlp process
-  req.on('close', () => {
-    console.log('[Streamer] Client disconnected, killing yt-dlp process');
-    child.kill('SIGTERM');
-  });
+    req.on('close', () => child.kill());
+    return;
+  } catch (spawnErr) {
+    console.error('[Fallback spawn failed]:', spawnErr.message);
+  }
+
+  if (!res.headersSent) {
+    res.status(500).send('Unable to stream media at this moment.');
+  }
 });
 
 // SEO Sitemap & Robots Routes
-app.get('/sitemap.xml', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'sitemap.xml'));
-});
+app.get('/sitemap.xml', (req, res) => res.sendFile(path.join(__dirname, 'public', 'sitemap.xml')));
+app.get('/robots.txt', (req, res) => res.sendFile(path.join(__dirname, 'public', 'robots.txt')));
 
-app.get('/robots.txt', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'robots.txt'));
+// SPA Fallback
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, 'dist', 'index.html'), (err) => {
+    if (err) res.status(404).send('Page not found');
+  });
 });
 
 // Helper Function: Format seconds to MM:SS
