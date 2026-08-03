@@ -1,0 +1,10 @@
+# Robots.txt for Green Hole Video Downloader (greenhole.online)
+User-agent: *
+Allow: /
+Disallow: /api/
+
+# Crawl delay optimization
+Crawl-delay: 1
+
+# Sitemap Location
+Sitemap: https://greenhole.online/sitemap.xml
