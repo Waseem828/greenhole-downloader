@@ -31,12 +31,11 @@ let ytDlpBinaryPath = isWindows
   ? path.join(__dirname, 'node_modules', 'yt-dlp-exec', 'bin', 'yt-dlp.exe')
   : path.join(__dirname, 'bin', 'yt-dlp');
 
-// Fallback for Windows if yt-dlp-exec not in node_modules
 if (isWindows && !fs.existsSync(ytDlpBinaryPath)) {
   ytDlpBinaryPath = path.join(__dirname, 'bin', 'yt-dlp.exe');
 }
 
-console.log(`[Server Engine] Initialized yt-dlp binary path: ${ytDlpBinaryPath}`);
+console.log(`[Server Engine] Using yt-dlp binary path: ${ytDlpBinaryPath}`);
 
 // Dedicated Clean HTML Page Routes
 app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'terms.html')));
@@ -89,13 +88,11 @@ app.post('/api/parse', async (req, res) => {
 
     let output = {};
     
-    // Primary: Extract via yt-dlp
     try {
       output = await extractMetadata(url);
     } catch (ytErr) {
-      console.warn(`[Parser Warning] yt-dlp primary parse warning:`, ytErr.message);
+      console.warn(`[Parser Warning] yt-dlp parse warning:`, ytErr.message);
 
-      // TikTok Fallback via TikWM
       if (platform === 'tiktok') {
         try {
           const tikRes = await axios.get(`https://www.tikwm.com/api/?url=${encodeURIComponent(url)}`, { timeout: 8000 });
@@ -117,33 +114,36 @@ app.post('/api/parse', async (req, res) => {
     const author = output.uploader || output.channel || `@${platform}_user`;
     const duration = output.duration ? formatSeconds(Math.round(output.duration)) : '03:15';
 
+    // Clean title for URLs
+    const cleanTitle = title.replace(/[^\w\s.-]/g, '_').substring(0, 80);
+
     const formats = [
       {
         quality: '1080p Full HD',
         format: 'MP4',
         size: 'High Quality',
-        downloadUrl: `/api/download?url=${encodeURIComponent(url)}&quality=1080&filename=${encodeURIComponent(title)}.mp4`,
+        downloadUrl: `/api/download?url=${encodeURIComponent(url)}&quality=1080&filename=${encodeURIComponent(cleanTitle)}.mp4`,
         type: 'video'
       },
       {
         quality: '720p HD',
         format: 'MP4',
         size: 'Standard Quality',
-        downloadUrl: `/api/download?url=${encodeURIComponent(url)}&quality=720&filename=${encodeURIComponent(title)}.mp4`,
+        downloadUrl: `/api/download?url=${encodeURIComponent(url)}&quality=720&filename=${encodeURIComponent(cleanTitle)}.mp4`,
         type: 'video'
       },
       {
         quality: '480p SD',
         format: 'MP4',
         size: 'Mobile Friendly',
-        downloadUrl: `/api/download?url=${encodeURIComponent(url)}&quality=480&filename=${encodeURIComponent(title)}.mp4`,
+        downloadUrl: `/api/download?url=${encodeURIComponent(url)}&quality=480&filename=${encodeURIComponent(cleanTitle)}.mp4`,
         type: 'video'
       },
       {
         quality: '320kbps MP3',
         format: 'MP3',
         size: 'Audio Only',
-        downloadUrl: `/api/download?url=${encodeURIComponent(url)}&type=audio&filename=${encodeURIComponent(title)}.mp3`,
+        downloadUrl: `/api/download?url=${encodeURIComponent(url)}&type=audio&filename=${encodeURIComponent(cleanTitle)}.mp3`,
         type: 'audio'
       }
     ];
@@ -164,35 +164,39 @@ app.get('/api/download', async (req, res) => {
   const videoUrl = req.query.url;
   const isAudio = req.query.type === 'audio';
   const quality = req.query.quality || '720';
-  const customFilename = req.query.filename || `GreenHole_Download_${Date.now()}.${isAudio ? 'mp3' : 'mp4'}`;
+  const rawFilename = req.query.filename || `GreenHole_Download_${Date.now()}.${isAudio ? 'mp3' : 'mp4'}`;
 
   if (!videoUrl) {
     return res.status(400).send('Error: Video URL parameter is missing');
   }
 
-  console.log(`[Streamer] Processing stream: ${videoUrl} | Type: ${isAudio ? 'audio' : 'video'} | Quality: ${quality}`);
+  // Sanitize filename to prevent HTTP header errors
+  const safeFilename = rawFilename.replace(/[^\w\s.-]/g, '_').substring(0, 100);
 
-  // Set HTTP headers for direct file download
-  res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(customFilename)}"`);
+  console.log(`[Streamer] Streaming: ${videoUrl} | Type: ${isAudio ? 'audio' : 'video'} | Quality: ${quality}`);
+
+  // RFC 5987 compatible Content-Disposition header
+  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
   res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
 
-  // Format string for yt-dlp
+  // Select PRE-MERGED formats (video+audio together) so ffmpeg is NOT required on server!
   let formatStr;
   if (isAudio) {
     formatStr = 'bestaudio[ext=m4a]/bestaudio/best';
   } else {
+    // Select pre-combined MP4 streams (vcodec!=none AND acodec!=none) or single best file
     switch (quality) {
       case '1080':
-        formatStr = 'best[height<=1080][ext=mp4]/best[height<=1080]/bestvideo[height<=1080]+bestaudio/best';
+        formatStr = 'best[height<=1080][ext=mp4]/best[height<=1080]/best[vcodec!=none][acodec!=none]/best';
         break;
       case '720':
-        formatStr = 'best[height<=720][ext=mp4]/best[height<=720]/bestvideo[height<=720]+bestaudio/best';
+        formatStr = 'best[height<=720][ext=mp4]/best[height<=720]/best[vcodec!=none][acodec!=none]/best';
         break;
       case '480':
-        formatStr = 'best[height<=480][ext=mp4]/best[height<=480]/bestvideo[height<=480]+bestaudio/best';
+        formatStr = 'best[height<=480][ext=mp4]/best[height<=480]/best[vcodec!=none][acodec!=none]/best';
         break;
       default:
-        formatStr = 'best[ext=mp4]/best';
+        formatStr = 'best[ext=mp4]/best[vcodec!=none][acodec!=none]/best';
     }
   }
 
@@ -212,7 +216,6 @@ app.get('/api/download', async (req, res) => {
 
     child.on('error', async (err) => {
       console.error('[yt-dlp spawn error]:', err.message);
-      // Fallback for TikTok if yt-dlp spawn fails
       if (videoUrl.includes('tiktok.com')) {
         return fallbackTikTokStream(videoUrl, isAudio, res);
       }
