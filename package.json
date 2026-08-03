@@ -5,6 +5,7 @@
   "main": "server.js",
   "type": "module",
   "scripts": {
+    "postinstall": "node scripts/setup-ytdlp.js",
     "dev": "concurrently \"node server.js\" \"vite\"",
     "dev:frontend": "vite",
     "dev:backend": "node server.js",
@@ -28,8 +29,7 @@
     "axios": "^1.7.9",
     "cors": "^2.8.5",
     "express": "^4.21.2",
-    "play-dl": "^1.9.7",
-    "yt-dlp-exec": "^1.0.2"
+    "play-dl": "^1.9.7"
   },
   "devDependencies": {
     "concurrently": "^10.0.4",

@@ -2,8 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { exec, spawn } from 'child_process';
-import execa from 'yt-dlp-exec';
+import { spawn } from 'child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -12,21 +11,27 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type']
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serve static frontend files from 'dist' (or root for dev)
+// Serve static frontend files from 'dist'
 app.use(express.static(path.join(__dirname, 'dist')));
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Path to yt-dlp binary — auto-detect OS
-// On Railway (Linux): use system yt-dlp installed via pip
-// On Windows (local dev): use bundled .exe
+// yt-dlp binary path
+// Windows (local dev): node_modules yt-dlp-exec binary
+// Linux (Hostinger):   bin/yt-dlp downloaded by postinstall script
 const isWindows = process.platform === 'win32';
 const ytDlpBinaryPath = isWindows
   ? path.join(__dirname, 'node_modules', 'yt-dlp-exec', 'bin', 'yt-dlp.exe')
-  : 'yt-dlp'; // system-level binary on Linux
+  : path.join(__dirname, 'bin', 'yt-dlp');
+
+console.log(`[Server] yt-dlp path: ${ytDlpBinaryPath}`);
 
 // Dedicated Clean HTML Page Routes
 app.get('/terms', (req, res) => {
@@ -63,18 +68,35 @@ app.post('/api/parse', async (req, res) => {
     else if (url.includes('instagram.com')) platform = 'instagram';
     else if (url.includes('facebook.com') || url.includes('fb.watch')) platform = 'facebook';
 
+    // Use spawn to run yt-dlp and get JSON metadata
     let output = {};
     try {
-      // Execute yt-dlp to extract JSON metadata
-      output = await execa(url, {
-        dumpSingleJson: true,
-        noWarnings: true,
-        noCallHome: true,
-        preferFreeFormats: true,
-        youtubeSkipDashManifest: true
+      const jsonData = await new Promise((resolve, reject) => {
+        const args = ['--dump-single-json', '--no-warnings', '--no-call-home', url];
+        const child = spawn(ytDlpBinaryPath, args);
+        let stdout = '';
+        let stderr = '';
+
+        child.stdout.on('data', d => { stdout += d.toString(); });
+        child.stderr.on('data', d => { stderr += d.toString(); });
+
+        child.on('close', code => {
+          if (code === 0 && stdout) {
+            try { resolve(JSON.parse(stdout)); }
+            catch (e) { reject(new Error('JSON parse failed')); }
+          } else {
+            reject(new Error(stderr || 'yt-dlp exited with code ' + code));
+          }
+        });
+
+        child.on('error', reject);
+
+        // 30 second timeout
+        setTimeout(() => { child.kill(); reject(new Error('Timeout')); }, 30000);
       });
+      output = jsonData;
     } catch (ytErr) {
-      console.warn(`[Parser Warning] yt-dlp direct parse fallback triggered:`, ytErr.message);
+      console.warn(`[Parser Warning] yt-dlp fallback:`, ytErr.message);
     }
 
     const title = output.title || `${platform.toUpperCase()} Download ${Date.now()}`;
@@ -82,7 +104,6 @@ app.post('/api/parse', async (req, res) => {
     const author = output.uploader || output.channel || `@${platform}_user`;
     const duration = output.duration ? formatSeconds(output.duration) : '03:15';
 
-    // Standardized Formats Array
     const formats = [
       {
         quality: '1080p Full HD',
@@ -114,15 +135,7 @@ app.post('/api/parse', async (req, res) => {
       }
     ];
 
-    return res.json({
-      success: true,
-      title,
-      thumbnail,
-      author,
-      duration,
-      platform,
-      formats
-    });
+    return res.json({ success: true, title, thumbnail, author, duration, platform, formats });
 
   } catch (error) {
     console.error('[API Error /api/parse]:', error.message);
