@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import { spawn } from 'child_process';
 import axios from 'axios';
 import fs from 'fs';
+import https from 'https';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -35,7 +36,51 @@ if (isWindows && !fs.existsSync(ytDlpBinaryPath)) {
   ytDlpBinaryPath = path.join(__dirname, 'bin', 'yt-dlp.exe');
 }
 
-console.log(`[Server Engine] Using yt-dlp binary path: ${ytDlpBinaryPath}`);
+// Function to auto-download Linux yt-dlp binary on Hostinger server if missing
+function downloadFile(url, dest) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      if (res.statusCode === 301 || res.statusCode === 302) {
+        return downloadFile(res.headers.location, dest).then(resolve).catch(reject);
+      }
+      if (res.statusCode !== 200) {
+        return reject(new Error(`Status ${res.statusCode}`));
+      }
+      const file = fs.createWriteStream(dest);
+      res.pipe(file);
+      file.on('finish', () => {
+        file.close(() => resolve());
+      });
+      file.on('error', (err) => {
+        fs.unlink(dest, () => reject(err));
+      });
+    }).on('error', reject);
+  });
+}
+
+async function ensureYtDlpBinary() {
+  if (isWindows) return;
+  const binDir = path.join(__dirname, 'bin');
+  const binPath = path.join(binDir, 'yt-dlp');
+
+  if (fs.existsSync(binPath) && fs.statSync(binPath).size > 10000000) {
+    console.log('[Server Engine] Linux yt-dlp binary is verified and ready.');
+    return;
+  }
+
+  console.log('[Server Engine] Downloading standalone Linux yt-dlp binary on server startup...');
+  if (!fs.existsSync(binDir)) {
+    fs.mkdirSync(binDir, { recursive: true });
+  }
+
+  try {
+    await downloadFile('https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux', binPath);
+    try { fs.chmodSync(binPath, '755'); } catch (e) {}
+    console.log(`[Server Engine] Linux yt-dlp binary downloaded successfully (${fs.statSync(binPath).size} bytes)`);
+  } catch (err) {
+    console.error('[Server Engine Error] Failed to auto-download yt-dlp:', err.message);
+  }
+}
 
 // Dedicated Clean HTML Page Routes
 app.get('/terms', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'terms.html')));
@@ -45,6 +90,7 @@ app.get('/about', (req, res) => res.sendFile(path.join(__dirname, 'dist', 'about
 
 // Helper: Run yt-dlp dump JSON
 async function extractMetadata(url) {
+  await ensureYtDlpBinary();
   return new Promise((resolve, reject) => {
     const args = ['--dump-single-json', '--no-warnings', '--no-call-home', '--no-playlist', url];
     const child = spawn(ytDlpBinaryPath, args);
@@ -114,7 +160,6 @@ app.post('/api/parse', async (req, res) => {
     const author = output.uploader || output.channel || `@${platform}_user`;
     const duration = output.duration ? formatSeconds(Math.round(output.duration)) : '03:15';
 
-    // Clean title for URLs
     const cleanTitle = title.replace(/[^\w\s.-]/g, '_').substring(0, 80);
 
     const formats = [
@@ -170,21 +215,19 @@ app.get('/api/download', async (req, res) => {
     return res.status(400).send('Error: Video URL parameter is missing');
   }
 
-  // Sanitize filename to prevent HTTP header errors
+  await ensureYtDlpBinary();
+
   const safeFilename = rawFilename.replace(/[^\w\s.-]/g, '_').substring(0, 100);
 
   console.log(`[Streamer] Streaming: ${videoUrl} | Type: ${isAudio ? 'audio' : 'video'} | Quality: ${quality}`);
 
-  // RFC 5987 compatible Content-Disposition header
   res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
   res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
 
-  // Select PRE-MERGED formats (video+audio together) so ffmpeg is NOT required on server!
   let formatStr;
   if (isAudio) {
     formatStr = 'bestaudio[ext=m4a]/bestaudio/best';
   } else {
-    // Select pre-combined MP4 streams (vcodec!=none AND acodec!=none) or single best file
     switch (quality) {
       case '1080':
         formatStr = 'best[height<=1080][ext=mp4]/best[height<=1080]/best[vcodec!=none][acodec!=none]/best';
@@ -200,7 +243,6 @@ app.get('/api/download', async (req, res) => {
     }
   }
 
-  // METHOD 1: Spawn yt-dlp to stream directly
   try {
     const args = ['-f', formatStr, '--no-playlist', '--no-warnings', '-o', '-', videoUrl];
     const child = spawn(ytDlpBinaryPath, args);
@@ -232,7 +274,6 @@ app.get('/api/download', async (req, res) => {
     console.error('[Spawn Exception]:', spawnErr.message);
   }
 
-  // TikTok Fallback if spawn throws
   if (videoUrl.includes('tiktok.com')) {
     return fallbackTikTokStream(videoUrl, isAudio, res);
   }
@@ -283,6 +324,7 @@ function formatSeconds(seconds) {
 }
 
 // Start Server
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Green Hole Downloader Backend API running on port ${PORT}`);
+  await ensureYtDlpBinary();
 });
