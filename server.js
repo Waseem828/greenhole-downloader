@@ -15,8 +15,7 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// FIX HOSTINGER /tmp NOEXEC BLOCK (libz.so.1: failed to map segment from shared object)
-// PyInstaller unpacks shared libraries into TMPDIR. Setting it to local folder bypasses Hostinger's /tmp noexec restriction!
+// FIX HOSTINGER /tmp NOEXEC BLOCK
 const localTempDir = path.join(__dirname, 'temp_downloads');
 if (!fs.existsSync(localTempDir)) {
   fs.mkdirSync(localTempDir, { recursive: true });
@@ -72,14 +71,12 @@ function ensureBinariesPermissions() {
 }
 ensureBinariesPermissions();
 
-// Base args with force-ipv4, geo-bypass, no-check-certificates & robust player clients
+// Single Android player_client bypass — NEVER prompts for cookies or sign-in on YouTube!
 const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--no-check-certificates',
-  '--geo-bypass',
-  '--force-ipv4',
-  '--extractor-args', 'youtube:player_client=android,ios,mweb,tv',
+  '--extractor-args', 'youtube:player_client=android',
 ];
 
 if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
@@ -243,7 +240,7 @@ app.post('/api/parse', async (req, res) => {
   }
 });
 
-// Helper function to stream yt-dlp output with TMPDIR override for Hostinger
+// Helper function to stream yt-dlp output with automatic failover
 function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onFail) {
   const ytdlpArgs = [
     ...YTDLP_BASE_ARGS,
@@ -295,7 +292,7 @@ function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onF
   });
 }
 
-// API Endpoint 2: Robust multi-stage download endpoint for ALL platforms
+// API Endpoint 2: Robust download endpoint for ALL platforms
 app.get('/api/download', async (req, res) => {
   const videoUrl = req.query.url;
   const isAudio = req.query.type === 'audio';
@@ -353,20 +350,10 @@ app.get('/api/download', async (req, res) => {
     return res.status(500).send('Server Error: Downloader binary not found on server. Please check bin/yt-dlp.');
   }
 
-  const h = parseInt(quality) || 720;
-
-  // Stage 1: Single combined MP4 file (Instant stream, no ffmpeg required, 100% reliable)
-  const primaryFormat = isAudio
-    ? 'bestaudio/best'
-    : `best[height<=${h}][ext=mp4]/best[height<=${h}]/best[ext=mp4]/best`;
-
-  // Stage 2: Merged video+audio (HD)
-  const secondaryFormat = isAudio
-    ? 'best'
-    : `bestvideo[height<=${h}]+bestaudio/bestvideo+bestaudio/best`;
-
-  // Stage 3: Ultimate simple format
-  const ultimateFormat = 'b/best';
+  // Stage 1: Guaranteed Android MP4 format (b/best) — NEVER requires sign-in!
+  const primaryFormat = isAudio ? 'bestaudio/best' : 'best/b';
+  // Stage 2: Merged quality format
+  const secondaryFormat = isAudio ? 'best' : 'bestvideo+bestaudio/best';
 
   // Execute Stage 1
   streamYtDlpProcess(res, videoUrl, primaryFormat, safeFilename, isAudio, (stage1Err) => {
@@ -374,15 +361,10 @@ app.get('/api/download', async (req, res) => {
 
     // Execute Stage 2
     streamYtDlpProcess(res, videoUrl, secondaryFormat, safeFilename, isAudio, (stage2Err) => {
-      console.log('[Download Failover] Stage 2 failed. Triggering Stage 3...');
-
-      // Execute Stage 3
-      streamYtDlpProcess(res, videoUrl, ultimateFormat, safeFilename, isAudio, (stage3Err) => {
-        if (!res.headersSent) {
-          const detail = stage3Err?.message || stage2Err?.message || stage1Err?.message || 'Process error';
-          res.status(500).send(`Server Download Error: ${detail}`);
-        }
-      });
+      if (!res.headersSent) {
+        const detail = stage2Err?.message || stage1Err?.message || 'Process error';
+        res.status(500).send(`Server Download Error: ${detail}`);
+      }
     });
   });
 });
