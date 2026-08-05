@@ -211,17 +211,12 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  async function downloadFile(fileUrl, filename, type) {
-    showToast(`⬇ Download شروع ہو رہی ہے: ${filename}`, 'info');
+  function downloadFile(fileUrl, filename, type) {
+    showToast(`⬇ Download شروع ہو رہی ہے...`, 'info');
 
-    // Direct anchor download — browser streams instantly without waiting for full file in memory
-    const a = document.createElement('a');
-    a.href = fileUrl;
-    a.download = filename;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
+    // Use window.location.href for native Content-Disposition attachment download
+    // This allows Chrome to seamlessly follow 302 redirects to media CDNs without cross-origin anchor blocks
+    window.location.href = fileUrl;
   }
 
   // 5. Format Tab Switcher (Video MP4 vs Audio MP3)
