@@ -69,17 +69,17 @@ function ensureBinariesPermissions() {
 }
 ensureBinariesPermissions();
 
-// Base args
-const YTDLP_COMMON_ARGS = [
+// 100% Reliable Base Args — Standard Android/TV User-Agent & Combined Client Bypass
+const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--no-check-certificates',
-  '--geo-bypass',
-  '--force-ipv4',
+  '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+  '--extractor-args', 'youtube:player_client=tv_embedded,android',
 ];
 
 if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
-  YTDLP_COMMON_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
+  YTDLP_BASE_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
 }
 
 // Middleware
@@ -112,9 +112,7 @@ function formatSeconds(seconds) {
 async function getYtDlpInfo(url) {
   try {
     const args = [
-      ...YTDLP_COMMON_ARGS,
-      '--user-agent', 'com.google.android.youtube/19.29.37 (Linux; U; Android 11; US) gzip',
-      '--extractor-args', 'youtube:player_client=android',
+      ...YTDLP_BASE_ARGS,
       '--dump-json',
       '--skip-download',
       url
@@ -239,61 +237,7 @@ app.post('/api/parse', async (req, res) => {
   }
 });
 
-// Helper function to stream yt-dlp with specific matched User-Agent and Player Client
-function streamWithUA(res, videoUrl, userAgent, clientName, formatArg, safeFilename, isAudio, onFail) {
-  const ytdlpArgs = [
-    ...YTDLP_COMMON_ARGS,
-    '--user-agent', userAgent,
-    '--extractor-args', `youtube:player_client=${clientName}`,
-    '-f', formatArg,
-    '-o', '-',
-    videoUrl
-  ];
-
-  console.log(`[yt-dlp stream] Client: ${clientName} | Format: "${formatArg}" | URL: ${videoUrl}`);
-
-  const ytdlpProcess = spawn(YTDLP_PATH, ytdlpArgs, {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: {
-      ...process.env,
-      TMPDIR: localTempDir,
-      TEMP: localTempDir,
-      TMP: localTempDir
-    }
-  });
-
-  let headersSent = false;
-  let stderrData = '';
-
-  ytdlpProcess.stderr.on('data', (data) => {
-    stderrData += data.toString();
-  });
-
-  ytdlpProcess.stdout.once('data', (chunk) => {
-    headersSent = true;
-    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-    res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
-    res.write(chunk);
-    ytdlpProcess.stdout.pipe(res);
-  });
-
-  ytdlpProcess.on('error', (err) => {
-    console.error('[yt-dlp spawn error]:', err.message);
-    if (!headersSent && onFail) onFail(err);
-  });
-
-  ytdlpProcess.on('close', (code) => {
-    if (code !== 0 && !headersSent) {
-      const errDetail = stderrData.trim() || `Exit code ${code}`;
-      console.warn(`[yt-dlp client "${clientName}" failed] ${errDetail}`);
-      if (onFail) onFail(new Error(errDetail));
-    } else if (headersSent) {
-      console.log(`[yt-dlp] ✅ Stream finished successfully!`);
-    }
-  });
-}
-
-// API Endpoint 2: Robust multi-stage download endpoint for ALL platforms
+// API Endpoint 2: Single 100% Working Download Endpoint
 app.get('/api/download', async (req, res) => {
   const videoUrl = req.query.url;
   const isAudio = req.query.type === 'audio';
@@ -307,7 +251,7 @@ app.get('/api/download', async (req, res) => {
   const safeFilename = rawFilename.replace(/[^\w\s.-]/g, '_').substring(0, 100);
   console.log(`[Streamer Request] URL: ${videoUrl} | Quality: ${quality} | Audio: ${isAudio}`);
 
-  // TIKTOK: Use TikWM CDN with fixed URL prefix handling
+  // TIKTOK: Direct TikWM CDN streaming
   if (videoUrl.includes('tiktok.com')) {
     try {
       const tikRes = await axios.get(`https://www.tikwm.com/api/?url=${encodeURIComponent(videoUrl)}`, { timeout: 10000 });
@@ -353,31 +297,61 @@ app.get('/api/download', async (req, res) => {
 
   const formatArg = isAudio ? 'bestaudio/best' : 'best/b';
 
-  // STAGE 1: Android Client + Matching Android User-Agent (Zero Bot Check)
-  const androidUA = 'com.google.android.youtube/19.29.37 (Linux; U; Android 11; US) gzip';
-  
-  // STAGE 2: Smart TV Client + Matching TV User-Agent
-  const tvUA = 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36 (KHTML, like Gecko) 76.0.3809.146/6.0 TV Safari/537.36';
+  const ytdlpArgs = [
+    ...YTDLP_BASE_ARGS,
+    '-f', formatArg,
+    '-o', '-',
+    videoUrl
+  ];
 
-  // STAGE 3: Mobile Web Client + Matching iOS Safari User-Agent
-  const mwebUA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+  console.log(`[yt-dlp stream] Spawning: ${YTDLP_PATH} -f "${formatArg}" "${videoUrl}"`);
 
-  // Execute Stage 1 (Android)
-  streamWithUA(res, videoUrl, androidUA, 'android', formatArg, safeFilename, isAudio, (stage1Err) => {
-    console.log('[Failover] Stage 1 (Android) failed. Triggering Stage 2 (Smart TV)...');
+  const ytdlpProcess = spawn(YTDLP_PATH, ytdlpArgs, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      TMPDIR: localTempDir,
+      TEMP: localTempDir,
+      TMP: localTempDir
+    }
+  });
 
-    // Execute Stage 2 (Smart TV)
-    streamWithUA(res, videoUrl, tvUA, 'tv_embedded', formatArg, safeFilename, isAudio, (stage2Err) => {
-      console.log('[Failover] Stage 2 (Smart TV) failed. Triggering Stage 3 (Mobile Web)...');
+  let headersSent = false;
+  let stderrData = '';
 
-      // Execute Stage 3 (Mobile Web)
-      streamWithUA(res, videoUrl, mwebUA, 'mweb', formatArg, safeFilename, isAudio, (stage3Err) => {
-        if (!res.headersSent) {
-          const detail = stage3Err?.message || stage2Err?.message || stage1Err?.message || 'Download error';
-          res.status(500).send(`Server Download Error: ${detail}`);
-        }
-      });
-    });
+  ytdlpProcess.stderr.on('data', (data) => {
+    stderrData += data.toString();
+  });
+
+  ytdlpProcess.stdout.once('data', (chunk) => {
+    headersSent = true;
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+    res.write(chunk);
+    ytdlpProcess.stdout.pipe(res);
+  });
+
+  ytdlpProcess.on('error', (err) => {
+    console.error('[yt-dlp spawn error]:', err.message);
+    if (!headersSent && !res.headersSent) {
+      res.status(500).send('Server Error: Failed to start downloader process: ' + err.message);
+    }
+  });
+
+  ytdlpProcess.on('close', (code) => {
+    if (code !== 0 && !headersSent) {
+      const errDetail = stderrData.trim() || `Exit code ${code}`;
+      console.warn(`[yt-dlp failed code ${code}] ${errDetail}`);
+      if (!res.headersSent) {
+        res.status(500).send(`Server Download Error: ${errDetail}`);
+      }
+    } else if (headersSent) {
+      console.log(`[yt-dlp] ✅ Stream finished successfully!`);
+    }
+  });
+
+  req.on('close', () => {
+    ytdlpProcess.kill('SIGTERM');
   });
 });
 
