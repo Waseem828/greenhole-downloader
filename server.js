@@ -1,9 +1,10 @@
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import axios from 'axios';
-import { spawn, execFile } from 'child_process';
+import { spawn, execFile, execSync } from 'child_process';
 import { promisify } from 'util';
 import ffmpegStatic from 'ffmpeg-static';
 
@@ -22,7 +23,37 @@ const YTDLP_PATH = process.platform === 'win32'
 // Path to ffmpeg binary — from ffmpeg-static npm package (works on Windows + Linux)
 const FFMPEG_PATH = ffmpegStatic;
 
-// Common yt-dlp args — Node.js runtime enables po_token for 720p/1080p
+// Ensure yt-dlp binary exists & has executable permissions on Linux (Hostinger)
+function ensureYtDlpBinary() {
+  if (process.platform === 'win32') return;
+
+  const binDir = path.join(__dirname, 'bin');
+  if (!fs.existsSync(binDir)) {
+    fs.mkdirSync(binDir, { recursive: true });
+  }
+
+  const ytdlpLinuxPath = path.join(binDir, 'yt-dlp');
+  if (!fs.existsSync(ytdlpLinuxPath)) {
+    console.log('[Server Startup] yt-dlp binary missing! Downloading for Linux...');
+    try {
+      execSync(
+        `curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux -o "${ytdlpLinuxPath}"`,
+        { stdio: 'inherit', timeout: 120000 }
+      );
+      execSync(`chmod +x "${ytdlpLinuxPath}"`, { stdio: 'inherit' });
+      console.log('[Server Startup] ✅ yt-dlp binary downloaded and executable!');
+    } catch (e) {
+      console.error('[Server Startup] Failed to download yt-dlp binary:', e.message);
+    }
+  } else {
+    try {
+      execSync(`chmod +x "${ytdlpLinuxPath}"`, { stdio: 'ignore' });
+    } catch (e) {}
+  }
+}
+ensureYtDlpBinary();
+
+// Common yt-dlp args
 const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
@@ -57,7 +88,7 @@ function formatSeconds(seconds) {
   return `${mins < 10 ? '0' : ''}${mins}:${secs < 10 ? '0' : ''}${secs}`;
 }
 
-// Helper: Get video info using yt-dlp --dump-json (android client)
+// Helper: Get video info using yt-dlp --dump-json
 async function getYtDlpInfo(url) {
   try {
     const args = [
@@ -100,7 +131,7 @@ app.post('/api/parse', async (req, res) => {
     let author = `@${platform}_creator`;
     let duration = '03:15';
 
-    // TikTok: Use TikWM API (fastest for TikTok)
+    // TikTok: Use TikWM API
     if (platform === 'tiktok') {
       try {
         const tikRes = await axios.get(`https://www.tikwm.com/api/?url=${encodeURIComponent(cleanUrl)}`, { timeout: 8000 });
@@ -115,7 +146,7 @@ app.post('/api/parse', async (req, res) => {
         console.warn('[TikTok parse warning]:', ttErr.message);
       }
     } else {
-      // YouTube/Instagram/Facebook: use yt-dlp android client
+      // YouTube/Instagram/Facebook: use yt-dlp
       const info = await getYtDlpInfo(cleanUrl);
       if (info) {
         title = info.title || title;
@@ -182,7 +213,7 @@ app.post('/api/parse', async (req, res) => {
   }
 });
 
-// API Endpoint 2: Download via yt-dlp (android client — no cookies needed)
+// API Endpoint 2: Stream download via yt-dlp
 app.get('/api/download', async (req, res) => {
   const videoUrl = req.query.url;
   const isAudio = req.query.type === 'audio';
@@ -226,68 +257,74 @@ app.get('/api/download', async (req, res) => {
     }
   }
 
-  // YOUTUBE / INSTAGRAM / FACEBOOK: yt-dlp android client streaming
-  // With ffmpeg available, merge separate video+audio streams for true 1080p/720p
+  // Ensure binary exists on Linux
+  if (!fs.existsSync(YTDLP_PATH) && process.platform !== 'win32') {
+    ensureYtDlpBinary();
+  }
+
+  if (!fs.existsSync(YTDLP_PATH)) {
+    return res.status(500).send('Server Error: yt-dlp downloader engine is initializing. Please try again in a few seconds.');
+  }
+
   let formatArg;
   if (isAudio) {
     formatArg = 'bestaudio[ext=m4a]/bestaudio/best';
   } else {
-    const h = parseInt(quality);
-    // Merged format: best video + best audio up to target height (requires ffmpeg)
-    // Falls back to single combined file if merge not possible
+    const h = parseInt(quality) || 720;
     formatArg = `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}][ext=mp4]/best[height<=${h}]/best`;
   }
 
   const ytdlpArgs = [
     ...YTDLP_BASE_ARGS,
     '-f', formatArg,
-    '-o', '-',   // pipe to stdout
+    '-o', '-',
     videoUrl
   ];
 
-  console.log(`[yt-dlp] Args: -f "${formatArg}" "${videoUrl}"`);
-
-  res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-  res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
-  res.setHeader('Transfer-Encoding', 'chunked');
+  console.log(`[yt-dlp] Spawn: ${YTDLP_PATH} -f "${formatArg}" "${videoUrl}"`);
 
   const ytdlpProcess = spawn(YTDLP_PATH, ytdlpArgs, {
     stdio: ['ignore', 'pipe', 'pipe']
   });
 
+  let headersSent = false;
   let stderrData = '';
-  let headersSentByPipe = false;
 
   ytdlpProcess.stderr.on('data', (data) => {
     stderrData += data.toString();
-    process.stdout.write('[yt-dlp] ' + data.toString());
+    console.log('[yt-dlp log]:', data.toString().trim());
   });
 
-  ytdlpProcess.stdout.on('data', (chunk) => {
-    headersSentByPipe = true;
+  // Only set attachment headers once first byte of real video data arrives!
+  ytdlpProcess.stdout.once('data', (chunk) => {
+    headersSent = true;
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+    res.write(chunk);
+    ytdlpProcess.stdout.pipe(res);
   });
 
   ytdlpProcess.on('error', (err) => {
     console.error('[yt-dlp spawn error]:', err.message);
-    if (!res.headersSent) res.status(500).send('yt-dlp failed to start: ' + err.message);
+    if (!headersSent && !res.headersSent) {
+      res.status(500).send('Server Error: Failed to start downloader process: ' + err.message);
+    }
   });
 
   ytdlpProcess.on('close', (code) => {
-    if (code !== 0) {
-      console.error(`[yt-dlp] exited code ${code}`);
-      if (!headersSentByPipe && !res.headersSent) {
-        res.status(500).send('Download failed. YouTube may be blocking this request. Please try again.');
+    if (code !== 0 && !headersSent) {
+      console.error(`[yt-dlp failed before data] exit code: ${code}. Stderr: ${stderrData}`);
+      if (!res.headersSent) {
+        res.status(500).send('Video download failed. YouTube may be restricting this request. Please try again.');
       }
     } else {
-      console.log(`[yt-dlp] ✅ Complete: ${videoUrl}`);
+      console.log(`[yt-dlp] ✅ Stream finished for: ${videoUrl}`);
     }
   });
 
   req.on('close', () => {
     ytdlpProcess.kill('SIGTERM');
   });
-
-  ytdlpProcess.stdout.pipe(res);
 });
 
 // SEO Routes
@@ -304,6 +341,6 @@ app.get('*', (req, res) => {
 // Start Server
 app.listen(PORT, () => {
   console.log(`✅ Green Hole Downloader Backend running on port ${PORT}`);
-  console.log(`🔧 yt-dlp: ${YTDLP_PATH}`);
-  console.log(`📱 Using Android client bypass (no cookies needed)`);
+  console.log(`🔧 yt-dlp path: ${YTDLP_PATH}`);
+  console.log(`🎬 ffmpeg path: ${FFMPEG_PATH}`);
 });
