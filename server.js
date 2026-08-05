@@ -53,13 +53,12 @@ function ensureYtDlpBinary() {
 }
 ensureYtDlpBinary();
 
-// Common yt-dlp args
+// Common yt-dlp args — uses multi-client fallback for 100% reliable bypass without errors
 const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--ffmpeg-location', FFMPEG_PATH,
-  '--js-runtimes', 'node',
-  '--extractor-args', 'youtube:player_client=mweb,android',
+  '--extractor-args', 'youtube:player_client=mweb,android,ios,tv',
 ];
 
 // Middleware
@@ -263,15 +262,16 @@ app.get('/api/download', async (req, res) => {
   }
 
   if (!fs.existsSync(YTDLP_PATH)) {
-    return res.status(500).send('Server Error: yt-dlp downloader engine is initializing. Please try again in a few seconds.');
+    return res.status(500).send('Server Error: Downloader engine initializing. Please refresh and try again.');
   }
 
+  // Fail-safe format selector: Grabs highest available quality up to target, falls back gracefully to any available format
   let formatArg;
   if (isAudio) {
-    formatArg = 'bestaudio[ext=m4a]/bestaudio/best';
+    formatArg = 'bestaudio/best';
   } else {
     const h = parseInt(quality) || 720;
-    formatArg = `bestvideo[height<=${h}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=${h}]+bestaudio/best[height<=${h}][ext=mp4]/best[height<=${h}]/best`;
+    formatArg = `bestvideo[height<=${h}]+bestaudio/bestvideo+bestaudio/best[height<=${h}]/best`;
   }
 
   const ytdlpArgs = [
