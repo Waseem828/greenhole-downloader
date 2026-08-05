@@ -20,7 +20,7 @@ const YTDLP_PATH = process.platform === 'win32'
   ? path.join(__dirname, 'bin', 'yt-dlp.exe')
   : path.join(__dirname, 'bin', 'yt-dlp');
 
-// Path to ffmpeg binary — from ffmpeg-static npm package (works on Windows + Linux)
+// Path to ffmpeg binary
 const FFMPEG_PATH = ffmpegStatic;
 
 // Ensure yt-dlp AND ffmpeg binaries exist & have executable (chmod +x) permissions on Linux (Hostinger)
@@ -43,7 +43,7 @@ function ensureBinariesPermissions() {
       );
       console.log('[Server Startup] ✅ yt-dlp binary downloaded!');
     } catch (e) {
-      console.error('[Server Startup] Failed to download yt-dlp binary:', e.message);
+      console.error('[Server Startup] Failed to download yt-dlp binary via curl:', e.message);
     }
   }
 
@@ -62,15 +62,16 @@ function ensureBinariesPermissions() {
 }
 ensureBinariesPermissions();
 
-// Base args with no-check-certificates & robust player clients (android,ios,mweb)
+// Base args with force-ipv4, geo-bypass, no-check-certificates & robust player clients
 const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--no-check-certificates',
-  '--extractor-args', 'youtube:player_client=android,ios,mweb',
+  '--geo-bypass',
+  '--force-ipv4',
+  '--extractor-args', 'youtube:player_client=android,ios,mweb,tv',
 ];
 
-// Add ffmpeg location if present
 if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
   YTDLP_BASE_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
 }
@@ -226,7 +227,7 @@ app.post('/api/parse', async (req, res) => {
   }
 });
 
-// Helper function to stream yt-dlp output with automatic failover
+// Helper function to stream yt-dlp output with automatic failover and detailed error reporting
 function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onFail) {
   const ytdlpArgs = [
     ...YTDLP_BASE_ARGS,
@@ -263,8 +264,9 @@ function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onF
 
   ytdlpProcess.on('close', (code) => {
     if (code !== 0 && !headersSent) {
-      console.warn(`[yt-dlp format "${formatArg}" failed code ${code}] Stderr: ${stderrData.substring(0, 200)}`);
-      if (onFail) onFail(new Error(stderrData || `Code ${code}`));
+      const errDetail = stderrData.trim() || `Process exited with code ${code}`;
+      console.warn(`[yt-dlp format "${formatArg}" failed] ${errDetail}`);
+      if (onFail) onFail(new Error(errDetail));
     } else if (headersSent) {
       console.log(`[yt-dlp] ✅ Stream finished successfully!`);
     }
@@ -326,7 +328,7 @@ app.get('/api/download', async (req, res) => {
   }
 
   if (!fs.existsSync(YTDLP_PATH)) {
-    return res.status(500).send('Server Error: Downloader engine initializing. Please refresh and try again.');
+    return res.status(500).send('Server Error: Downloader binary not found on server. Please check bin/yt-dlp.');
   }
 
   const h = parseInt(quality) || 720;
@@ -355,7 +357,8 @@ app.get('/api/download', async (req, res) => {
       // Execute Stage 3
       streamYtDlpProcess(res, videoUrl, ultimateFormat, safeFilename, isAudio, (stage3Err) => {
         if (!res.headersSent) {
-          res.status(500).send('Download failed. Please check the URL and try again.');
+          const detail = stage3Err?.message || stage2Err?.message || stage1Err?.message || 'Process error';
+          res.status(500).send(`Server Download Error: ${detail}`);
         }
       });
     });
