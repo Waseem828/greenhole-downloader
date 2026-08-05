@@ -62,13 +62,18 @@ function ensureBinariesPermissions() {
 }
 ensureBinariesPermissions();
 
-// Common yt-dlp args — uses multi-client fallback for 100% reliable bypass without errors
+// Base args with no-check-certificates & robust player clients (android,ios,mweb)
 const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
-  '--ffmpeg-location', FFMPEG_PATH,
-  '--extractor-args', 'youtube:player_client=mweb,android,ios,tv',
+  '--no-check-certificates',
+  '--extractor-args', 'youtube:player_client=android,ios,mweb',
 ];
+
+// Add ffmpeg location if present
+if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
+  YTDLP_BASE_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
+}
 
 // Middleware
 app.use(cors({
@@ -230,7 +235,7 @@ function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onF
     videoUrl
   ];
 
-  console.log(`[yt-dlp stream] Format "${formatArg}" for: ${videoUrl}`);
+  console.log(`[yt-dlp stream] Trying format "${formatArg}" for: ${videoUrl}`);
 
   const ytdlpProcess = spawn(YTDLP_PATH, ytdlpArgs, {
     stdio: ['ignore', 'pipe', 'pipe']
@@ -258,21 +263,15 @@ function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onF
 
   ytdlpProcess.on('close', (code) => {
     if (code !== 0 && !headersSent) {
-      console.warn(`[yt-dlp format "${formatArg}" failed with code ${code}] Stderr: ${stderrData.substring(0, 200)}`);
+      console.warn(`[yt-dlp format "${formatArg}" failed code ${code}] Stderr: ${stderrData.substring(0, 200)}`);
       if (onFail) onFail(new Error(stderrData || `Code ${code}`));
     } else if (headersSent) {
       console.log(`[yt-dlp] ✅ Stream finished successfully!`);
     }
   });
-
-  reqCloseHandler(ytdlpProcess);
 }
 
-function reqCloseHandler(processInstance) {
-  // Graceful cleanup if browser closes tab
-}
-
-// API Endpoint 2: Robust multi-stage download endpoint
+// API Endpoint 2: Robust multi-stage download endpoint for ALL platforms
 app.get('/api/download', async (req, res) => {
   const videoUrl = req.query.url;
   const isAudio = req.query.type === 'audio';
@@ -286,22 +285,27 @@ app.get('/api/download', async (req, res) => {
   const safeFilename = rawFilename.replace(/[^\w\s.-]/g, '_').substring(0, 100);
   console.log(`[Streamer Request] URL: ${videoUrl} | Quality: ${quality} | Audio: ${isAudio}`);
 
-  // TIKTOK: Use TikWM CDN (fast, no watermark)
+  // TIKTOK: Use TikWM CDN with fixed URL prefix handling
   if (videoUrl.includes('tiktok.com')) {
     try {
       const tikRes = await axios.get(`https://www.tikwm.com/api/?url=${encodeURIComponent(videoUrl)}`, { timeout: 10000 });
       if (tikRes.data && tikRes.data.data) {
         const d = tikRes.data.data;
-        let mediaUrl = isAudio ? d.music :
-          (d.hdplay ? `https://www.tikwm.com${d.hdplay}` : `https://www.tikwm.com${d.play}`);
+        let mediaUrl = isAudio ? d.music : (d.hdplay || d.play);
 
         if (mediaUrl) {
+          if (!mediaUrl.startsWith('http')) {
+            mediaUrl = 'https://www.tikwm.com' + mediaUrl;
+          }
+          console.log(`[TikTok CDN] Streaming directly: ${mediaUrl}`);
           const streamRes = await axios({
             method: 'get',
             url: mediaUrl,
             responseType: 'stream',
             timeout: 60000,
-            headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
           });
           res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
           res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
@@ -326,32 +330,32 @@ app.get('/api/download', async (req, res) => {
   }
 
   const h = parseInt(quality) || 720;
-  
-  // Stage 1: Best merged video+audio (HD)
+
+  // Stage 1: Single combined MP4 file (Instant stream, no ffmpeg required, 100% reliable)
   const primaryFormat = isAudio
     ? 'bestaudio/best'
-    : `bestvideo[height<=${h}]+bestaudio/bestvideo+bestaudio/best[height<=${h}]/best`;
+    : `best[height<=${h}][ext=mp4]/best[height<=${h}]/best[ext=mp4]/best`;
 
-  // Stage 2: Single file fallback (No ffmpeg dependency)
-  const fallbackFormat = isAudio
+  // Stage 2: Merged video+audio (HD)
+  const secondaryFormat = isAudio
     ? 'best'
-    : `best[ext=mp4]/best[height<=${h}]/best`;
+    : `bestvideo[height<=${h}]+bestaudio/bestvideo+bestaudio/best`;
 
   // Stage 3: Ultimate simple format
   const ultimateFormat = 'b/best';
 
   // Execute Stage 1
   streamYtDlpProcess(res, videoUrl, primaryFormat, safeFilename, isAudio, (stage1Err) => {
-    console.log('[Download Failover] Stage 1 failed. Triggering Stage 2 (Single-file fallback)...');
-    
+    console.log('[Download Failover] Stage 1 failed. Triggering Stage 2...');
+
     // Execute Stage 2
-    streamYtDlpProcess(res, videoUrl, fallbackFormat, safeFilename, isAudio, (stage2Err) => {
-      console.log('[Download Failover] Stage 2 failed. Triggering Stage 3 (Ultimate fallback)...');
-      
+    streamYtDlpProcess(res, videoUrl, secondaryFormat, safeFilename, isAudio, (stage2Err) => {
+      console.log('[Download Failover] Stage 2 failed. Triggering Stage 3...');
+
       // Execute Stage 3
       streamYtDlpProcess(res, videoUrl, ultimateFormat, safeFilename, isAudio, (stage3Err) => {
         if (!res.headersSent) {
-          res.status(500).send('Video download failed. YouTube may be restricting this request. Please try again.');
+          res.status(500).send('Download failed. Please check the URL and try again.');
         }
       });
     });
