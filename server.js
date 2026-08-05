@@ -32,11 +32,10 @@ const YTDLP_PATH = process.platform === 'win32'
 // Path to ffmpeg binary
 const FFMPEG_PATH = ffmpegStatic;
 
-// Ensure yt-dlp AND ffmpeg binaries exist & have executable (chmod +x) permissions on Linux (Hostinger)
+// Ensure yt-dlp AND ffmpeg binaries exist & have executable permissions on Linux (Hostinger)
 function ensureBinariesPermissions() {
   if (process.platform === 'win32') return;
 
-  // 1. Fix yt-dlp binary
   const binDir = path.join(__dirname, 'bin');
   if (!fs.existsSync(binDir)) {
     fs.mkdirSync(binDir, { recursive: true });
@@ -61,7 +60,6 @@ function ensureBinariesPermissions() {
     console.log('[Server Startup] ✅ yt-dlp permission set (chmod +x)!');
   } catch (e) {}
 
-  // 2. Fix ffmpeg binary permissions (CRITICAL for Hostinger Linux!)
   if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
     try {
       execSync(`chmod +x "${FFMPEG_PATH}"`, { stdio: 'ignore' });
@@ -71,16 +69,17 @@ function ensureBinariesPermissions() {
 }
 ensureBinariesPermissions();
 
-// Single Android player_client bypass — NEVER prompts for cookies or sign-in on YouTube!
-const YTDLP_BASE_ARGS = [
+// Base args
+const YTDLP_COMMON_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--no-check-certificates',
-  '--extractor-args', 'youtube:player_client=android',
+  '--geo-bypass',
+  '--force-ipv4',
 ];
 
 if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
-  YTDLP_BASE_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
+  YTDLP_COMMON_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
 }
 
 // Middleware
@@ -113,7 +112,9 @@ function formatSeconds(seconds) {
 async function getYtDlpInfo(url) {
   try {
     const args = [
-      ...YTDLP_BASE_ARGS,
+      ...YTDLP_COMMON_ARGS,
+      '--user-agent', 'com.google.android.youtube/19.29.37 (Linux; U; Android 11; US) gzip',
+      '--extractor-args', 'youtube:player_client=android',
       '--dump-json',
       '--skip-download',
       url
@@ -146,7 +147,6 @@ app.post('/api/parse', async (req, res) => {
     const cleanUrl = url.trim();
     console.log(`[Parser] Extracting metadata for: ${cleanUrl}`);
 
-    // Detect Platform
     let platform = 'video';
     if (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be')) platform = 'youtube';
     else if (cleanUrl.includes('tiktok.com')) platform = 'tiktok';
@@ -182,7 +182,6 @@ app.post('/api/parse', async (req, res) => {
         duration = info.duration ? formatSeconds(info.duration) : duration;
         console.log(`[Parser] yt-dlp success: ${title}`);
       } else if (platform === 'youtube') {
-        // Fallback to YouTube oEmbed
         try {
           const oembedRes = await axios.get(`https://www.youtube.com/oembed?url=${encodeURIComponent(cleanUrl)}&format=json`, { timeout: 5000 });
           if (oembedRes.data) {
@@ -240,16 +239,18 @@ app.post('/api/parse', async (req, res) => {
   }
 });
 
-// Helper function to stream yt-dlp output with automatic failover
-function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onFail) {
+// Helper function to stream yt-dlp with specific matched User-Agent and Player Client
+function streamWithUA(res, videoUrl, userAgent, clientName, formatArg, safeFilename, isAudio, onFail) {
   const ytdlpArgs = [
-    ...YTDLP_BASE_ARGS,
+    ...YTDLP_COMMON_ARGS,
+    '--user-agent', userAgent,
+    '--extractor-args', `youtube:player_client=${clientName}`,
     '-f', formatArg,
     '-o', '-',
     videoUrl
   ];
 
-  console.log(`[yt-dlp stream] Trying format "${formatArg}" for: ${videoUrl}`);
+  console.log(`[yt-dlp stream] Client: ${clientName} | Format: "${formatArg}" | URL: ${videoUrl}`);
 
   const ytdlpProcess = spawn(YTDLP_PATH, ytdlpArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -283,8 +284,8 @@ function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onF
 
   ytdlpProcess.on('close', (code) => {
     if (code !== 0 && !headersSent) {
-      const errDetail = stderrData.trim() || `Process exited with code ${code}`;
-      console.warn(`[yt-dlp format "${formatArg}" failed] ${errDetail}`);
+      const errDetail = stderrData.trim() || `Exit code ${code}`;
+      console.warn(`[yt-dlp client "${clientName}" failed] ${errDetail}`);
       if (onFail) onFail(new Error(errDetail));
     } else if (headersSent) {
       console.log(`[yt-dlp] ✅ Stream finished successfully!`);
@@ -292,7 +293,7 @@ function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onF
   });
 }
 
-// API Endpoint 2: Robust download endpoint for ALL platforms
+// API Endpoint 2: Robust multi-stage download endpoint for ALL platforms
 app.get('/api/download', async (req, res) => {
   const videoUrl = req.query.url;
   const isAudio = req.query.type === 'audio';
@@ -350,21 +351,32 @@ app.get('/api/download', async (req, res) => {
     return res.status(500).send('Server Error: Downloader binary not found on server. Please check bin/yt-dlp.');
   }
 
-  // Stage 1: Guaranteed Android MP4 format (b/best) — NEVER requires sign-in!
-  const primaryFormat = isAudio ? 'bestaudio/best' : 'best/b';
-  // Stage 2: Merged quality format
-  const secondaryFormat = isAudio ? 'best' : 'bestvideo+bestaudio/best';
+  const formatArg = isAudio ? 'bestaudio/best' : 'best/b';
 
-  // Execute Stage 1
-  streamYtDlpProcess(res, videoUrl, primaryFormat, safeFilename, isAudio, (stage1Err) => {
-    console.log('[Download Failover] Stage 1 failed. Triggering Stage 2...');
+  // STAGE 1: Android Client + Matching Android User-Agent (Zero Bot Check)
+  const androidUA = 'com.google.android.youtube/19.29.37 (Linux; U; Android 11; US) gzip';
+  
+  // STAGE 2: Smart TV Client + Matching TV User-Agent
+  const tvUA = 'Mozilla/5.0 (SMART-TV; LINUX; Tizen 6.0) AppleWebKit/537.36 (KHTML, like Gecko) 76.0.3809.146/6.0 TV Safari/537.36';
 
-    // Execute Stage 2
-    streamYtDlpProcess(res, videoUrl, secondaryFormat, safeFilename, isAudio, (stage2Err) => {
-      if (!res.headersSent) {
-        const detail = stage2Err?.message || stage1Err?.message || 'Process error';
-        res.status(500).send(`Server Download Error: ${detail}`);
-      }
+  // STAGE 3: Mobile Web Client + Matching iOS Safari User-Agent
+  const mwebUA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1';
+
+  // Execute Stage 1 (Android)
+  streamWithUA(res, videoUrl, androidUA, 'android', formatArg, safeFilename, isAudio, (stage1Err) => {
+    console.log('[Failover] Stage 1 (Android) failed. Triggering Stage 2 (Smart TV)...');
+
+    // Execute Stage 2 (Smart TV)
+    streamWithUA(res, videoUrl, tvUA, 'tv_embedded', formatArg, safeFilename, isAudio, (stage2Err) => {
+      console.log('[Failover] Stage 2 (Smart TV) failed. Triggering Stage 3 (Mobile Web)...');
+
+      // Execute Stage 3 (Mobile Web)
+      streamWithUA(res, videoUrl, mwebUA, 'mweb', formatArg, safeFilename, isAudio, (stage3Err) => {
+        if (!res.headersSent) {
+          const detail = stage3Err?.message || stage2Err?.message || stage1Err?.message || 'Download error';
+          res.status(500).send(`Server Download Error: ${detail}`);
+        }
+      });
     });
   });
 });
