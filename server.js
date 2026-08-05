@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url';
 import axios from 'axios';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
+import ffmpegStatic from 'ffmpeg-static';
 
 const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
@@ -13,18 +14,21 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Path to yt-dlp binary
-const YTDLP_PATH = path.join(__dirname, 'bin', 'yt-dlp.exe');
+// Path to yt-dlp binary — auto detect Windows vs Linux
+const YTDLP_PATH = process.platform === 'win32'
+  ? path.join(__dirname, 'bin', 'yt-dlp.exe')
+  : path.join(__dirname, 'bin', 'yt-dlp');
 
-// Path to ffmpeg binary (for merging 1080p video+audio streams)
-const FFMPEG_PATH = path.join(__dirname, 'bin', 'ffmpeg.exe');
+// Path to ffmpeg binary — from ffmpeg-static npm package (works on Windows + Linux)
+const FFMPEG_PATH = ffmpegStatic;
 
-// Common yt-dlp args that work without cookies (Android client bypass)
+// Common yt-dlp args — Node.js runtime enables po_token for 720p/1080p
 const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--ffmpeg-location', FFMPEG_PATH,
-  '--extractor-args', 'youtube:player_client=android',
+  '--js-runtimes', 'node',
+  '--extractor-args', 'youtube:player_client=mweb,android',
 ];
 
 // Middleware
