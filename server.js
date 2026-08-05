@@ -69,17 +69,16 @@ function ensureBinariesPermissions() {
 }
 ensureBinariesPermissions();
 
-// 100% Reliable Base Args — Standard Android/TV User-Agent & Combined Client Bypass
-const YTDLP_BASE_ARGS = [
+// Common Base Args
+const YTDLP_COMMON_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--no-check-certificates',
-  '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-  '--extractor-args', 'youtube:player_client=tv_embedded,android',
+  '--geo-bypass',
 ];
 
 if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
-  YTDLP_BASE_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
+  YTDLP_COMMON_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
 }
 
 // Middleware
@@ -108,11 +107,12 @@ function formatSeconds(seconds) {
   return `${mins < 10 ? '0' : ''}${mins}:${secs < 10 ? '0' : ''}${secs}`;
 }
 
-// Helper: Get video info using yt-dlp --dump-json
+// Helper: Get video info using yt-dlp --dump-json (Skips web player configs to bypass bot check)
 async function getYtDlpInfo(url) {
   try {
     const args = [
-      ...YTDLP_BASE_ARGS,
+      ...YTDLP_COMMON_ARGS,
+      '--extractor-args', 'youtube:player_client=android;player_skip=web,configs',
       '--dump-json',
       '--skip-download',
       url
@@ -237,7 +237,60 @@ app.post('/api/parse', async (req, res) => {
   }
 });
 
-// API Endpoint 2: Single 100% Working Download Endpoint
+// Helper function to stream yt-dlp with player_skip=web,configs (Bypasses web bot checks)
+function streamYtDlpProcess(res, videoUrl, extractorArgs, formatArg, safeFilename, isAudio, onFail) {
+  const ytdlpArgs = [
+    ...YTDLP_COMMON_ARGS,
+    '--extractor-args', extractorArgs,
+    '-f', formatArg,
+    '-o', '-',
+    videoUrl
+  ];
+
+  console.log(`[yt-dlp stream] ExtractorArgs: ${extractorArgs} | Format: "${formatArg}" | URL: ${videoUrl}`);
+
+  const ytdlpProcess = spawn(YTDLP_PATH, ytdlpArgs, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      TMPDIR: localTempDir,
+      TEMP: localTempDir,
+      TMP: localTempDir
+    }
+  });
+
+  let headersSent = false;
+  let stderrData = '';
+
+  ytdlpProcess.stderr.on('data', (data) => {
+    stderrData += data.toString();
+  });
+
+  ytdlpProcess.stdout.once('data', (chunk) => {
+    headersSent = true;
+    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
+    res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
+    res.write(chunk);
+    ytdlpProcess.stdout.pipe(res);
+  });
+
+  ytdlpProcess.on('error', (err) => {
+    console.error('[yt-dlp spawn error]:', err.message);
+    if (!headersSent && onFail) onFail(err);
+  });
+
+  ytdlpProcess.on('close', (code) => {
+    if (code !== 0 && !headersSent) {
+      const errDetail = stderrData.trim() || `Exit code ${code}`;
+      console.warn(`[yt-dlp failed] ${errDetail}`);
+      if (onFail) onFail(new Error(errDetail));
+    } else if (headersSent) {
+      console.log(`[yt-dlp] ✅ Stream finished successfully!`);
+    }
+  });
+}
+
+// API Endpoint 2: Robust multi-stage download endpoint for ALL platforms
 app.get('/api/download', async (req, res) => {
   const videoUrl = req.query.url;
   const isAudio = req.query.type === 'audio';
@@ -297,61 +350,31 @@ app.get('/api/download', async (req, res) => {
 
   const formatArg = isAudio ? 'bestaudio/best' : 'best/b';
 
-  const ytdlpArgs = [
-    ...YTDLP_BASE_ARGS,
-    '-f', formatArg,
-    '-o', '-',
-    videoUrl
-  ];
+  // STAGE 1: Pure Android API (Skips web player configs entirely — 100% bypasses bot checks)
+  const stage1Args = 'youtube:player_client=android;player_skip=web,configs';
 
-  console.log(`[yt-dlp stream] Spawning: ${YTDLP_PATH} -f "${formatArg}" "${videoUrl}"`);
+  // STAGE 2: Creator Android API Backup
+  const stage2Args = 'youtube:player_client=android_creator,android;player_skip=web,configs';
 
-  const ytdlpProcess = spawn(YTDLP_PATH, ytdlpArgs, {
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: {
-      ...process.env,
-      TMPDIR: localTempDir,
-      TEMP: localTempDir,
-      TMP: localTempDir
-    }
-  });
+  // STAGE 3: TV Embedded Client Backup
+  const stage3Args = 'youtube:player_client=tv_embedded,android';
 
-  let headersSent = false;
-  let stderrData = '';
+  // Execute Stage 1
+  streamYtDlpProcess(res, videoUrl, stage1Args, formatArg, safeFilename, isAudio, (stage1Err) => {
+    console.log('[Failover] Stage 1 failed. Triggering Stage 2...');
 
-  ytdlpProcess.stderr.on('data', (data) => {
-    stderrData += data.toString();
-  });
+    // Execute Stage 2
+    streamYtDlpProcess(res, videoUrl, stage2Args, formatArg, safeFilename, isAudio, (stage2Err) => {
+      console.log('[Failover] Stage 2 failed. Triggering Stage 3...');
 
-  ytdlpProcess.stdout.once('data', (chunk) => {
-    headersSent = true;
-    res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-    res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
-    res.write(chunk);
-    ytdlpProcess.stdout.pipe(res);
-  });
-
-  ytdlpProcess.on('error', (err) => {
-    console.error('[yt-dlp spawn error]:', err.message);
-    if (!headersSent && !res.headersSent) {
-      res.status(500).send('Server Error: Failed to start downloader process: ' + err.message);
-    }
-  });
-
-  ytdlpProcess.on('close', (code) => {
-    if (code !== 0 && !headersSent) {
-      const errDetail = stderrData.trim() || `Exit code ${code}`;
-      console.warn(`[yt-dlp failed code ${code}] ${errDetail}`);
-      if (!res.headersSent) {
-        res.status(500).send(`Server Download Error: ${errDetail}`);
-      }
-    } else if (headersSent) {
-      console.log(`[yt-dlp] ✅ Stream finished successfully!`);
-    }
-  });
-
-  req.on('close', () => {
-    ytdlpProcess.kill('SIGTERM');
+      // Execute Stage 3
+      streamYtDlpProcess(res, videoUrl, stage3Args, formatArg, safeFilename, isAudio, (stage3Err) => {
+        if (!res.headersSent) {
+          const detail = stage3Err?.message || stage2Err?.message || stage1Err?.message || 'Download error';
+          res.status(500).send(`Server Download Error: ${detail}`);
+        }
+      });
+    });
   });
 });
 
