@@ -15,6 +15,16 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// FIX HOSTINGER /tmp NOEXEC BLOCK (libz.so.1: failed to map segment from shared object)
+// PyInstaller unpacks shared libraries into TMPDIR. Setting it to local folder bypasses Hostinger's /tmp noexec restriction!
+const localTempDir = path.join(__dirname, 'temp_downloads');
+if (!fs.existsSync(localTempDir)) {
+  fs.mkdirSync(localTempDir, { recursive: true });
+}
+process.env.TMPDIR = localTempDir;
+process.env.TEMP = localTempDir;
+process.env.TMP = localTempDir;
+
 // Path to yt-dlp binary — auto detect Windows vs Linux
 const YTDLP_PATH = process.platform === 'win32'
   ? path.join(__dirname, 'bin', 'yt-dlp.exe')
@@ -113,7 +123,13 @@ async function getYtDlpInfo(url) {
     ];
     const { stdout } = await execFileAsync(YTDLP_PATH, args, {
       timeout: 30000,
-      maxBuffer: 10 * 1024 * 1024
+      maxBuffer: 10 * 1024 * 1024,
+      env: {
+        ...process.env,
+        TMPDIR: localTempDir,
+        TEMP: localTempDir,
+        TMP: localTempDir
+      }
     });
     return JSON.parse(stdout.trim());
   } catch (err) {
@@ -227,7 +243,7 @@ app.post('/api/parse', async (req, res) => {
   }
 });
 
-// Helper function to stream yt-dlp output with automatic failover and detailed error reporting
+// Helper function to stream yt-dlp output with TMPDIR override for Hostinger
 function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onFail) {
   const ytdlpArgs = [
     ...YTDLP_BASE_ARGS,
@@ -239,7 +255,13 @@ function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onF
   console.log(`[yt-dlp stream] Trying format "${formatArg}" for: ${videoUrl}`);
 
   const ytdlpProcess = spawn(YTDLP_PATH, ytdlpArgs, {
-    stdio: ['ignore', 'pipe', 'pipe']
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      TMPDIR: localTempDir,
+      TEMP: localTempDir,
+      TMP: localTempDir
+    }
   });
 
   let headersSent = false;
