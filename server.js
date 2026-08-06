@@ -32,6 +32,9 @@ const YTDLP_PATH = process.platform === 'win32'
 // Path to ffmpeg binary
 const FFMPEG_PATH = ffmpegStatic;
 
+// Path to optional Netscape cookies.txt file
+const COOKIES_PATH = path.join(__dirname, 'cookies.txt');
+
 // Ensure yt-dlp AND ffmpeg binaries exist & have executable permissions on Linux (Hostinger)
 function ensureBinariesPermissions() {
   if (process.platform === 'win32') return;
@@ -69,17 +72,21 @@ function ensureBinariesPermissions() {
 }
 ensureBinariesPermissions();
 
-// Common Base Args with matching Mobile User-Agent
-const YTDLP_COMMON_ARGS = [
+// Base args with automatic cookies.txt detection!
+const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--no-check-certificates',
-  '--geo-bypass',
-  '--user-agent', 'Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+  '--extractor-args', 'youtube:player_client=android_creator,android',
 ];
 
+if (fs.existsSync(COOKIES_PATH)) {
+  console.log('🍪 cookies.txt detected! Using session cookies for YouTube bypass...');
+  YTDLP_BASE_ARGS.push('--cookies', COOKIES_PATH);
+}
+
 if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
-  YTDLP_COMMON_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
+  YTDLP_BASE_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
 }
 
 // Middleware
@@ -108,12 +115,11 @@ function formatSeconds(seconds) {
   return `${mins < 10 ? '0' : ''}${mins}:${secs < 10 ? '0' : ''}${secs}`;
 }
 
-// Helper: Get video info using yt-dlp --dump-json (Skips web player configs to bypass bot check)
+// Helper: Get video info using yt-dlp --dump-json
 async function getYtDlpInfo(url) {
   try {
     const args = [
-      ...YTDLP_COMMON_ARGS,
-      '--extractor-args', 'youtube:player_client=android;player_skip=web,configs',
+      ...YTDLP_BASE_ARGS,
       '--dump-json',
       '--skip-download',
       url
@@ -238,17 +244,16 @@ app.post('/api/parse', async (req, res) => {
   }
 });
 
-// Helper function to stream yt-dlp with player_skip=web,configs (Bypasses web bot checks)
-function streamYtDlpProcess(res, videoUrl, extractorArgs, formatArg, safeFilename, isAudio, onFail) {
+// Helper function to stream yt-dlp output
+function streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, onFail) {
   const ytdlpArgs = [
-    ...YTDLP_COMMON_ARGS,
-    '--extractor-args', extractorArgs,
+    ...YTDLP_BASE_ARGS,
     '-f', formatArg,
     '-o', '-',
     videoUrl
   ];
 
-  console.log(`[yt-dlp stream] ExtractorArgs: ${extractorArgs} | Format: "${formatArg}" | URL: ${videoUrl}`);
+  console.log(`[yt-dlp stream] Format: "${formatArg}" | Cookies Active: ${fs.existsSync(COOKIES_PATH)} | URL: ${videoUrl}`);
 
   const ytdlpProcess = spawn(YTDLP_PATH, ytdlpArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -291,7 +296,7 @@ function streamYtDlpProcess(res, videoUrl, extractorArgs, formatArg, safeFilenam
   });
 }
 
-// API Endpoint 2: Robust multi-stage download endpoint for ALL platforms
+// API Endpoint 2: Robust download endpoint for ALL platforms
 app.get('/api/download', async (req, res) => {
   const videoUrl = req.query.url;
   const isAudio = req.query.type === 'audio';
@@ -351,31 +356,10 @@ app.get('/api/download', async (req, res) => {
 
   const formatArg = isAudio ? 'bestaudio/best' : 'best/b';
 
-  // STAGE 1: Pure Android API (Skips web player configs entirely — 100% bypasses bot checks)
-  const stage1Args = 'youtube:player_client=android;player_skip=web,configs';
-
-  // STAGE 2: Creator Android API Backup
-  const stage2Args = 'youtube:player_client=android_creator,android;player_skip=web,configs';
-
-  // STAGE 3: TV Embedded Client Backup
-  const stage3Args = 'youtube:player_client=tv_embedded,android';
-
-  // Execute Stage 1
-  streamYtDlpProcess(res, videoUrl, stage1Args, formatArg, safeFilename, isAudio, (stage1Err) => {
-    console.log('[Failover] Stage 1 failed. Triggering Stage 2...');
-
-    // Execute Stage 2
-    streamYtDlpProcess(res, videoUrl, stage2Args, formatArg, safeFilename, isAudio, (stage2Err) => {
-      console.log('[Failover] Stage 2 failed. Triggering Stage 3...');
-
-      // Execute Stage 3
-      streamYtDlpProcess(res, videoUrl, stage3Args, formatArg, safeFilename, isAudio, (stage3Err) => {
-        if (!res.headersSent) {
-          const detail = stage3Err?.message || stage2Err?.message || stage1Err?.message || 'Download error';
-          res.status(500).send(`Server Download Error: ${detail}`);
-        }
-      });
-    });
+  streamYtDlpProcess(res, videoUrl, formatArg, safeFilename, isAudio, (err) => {
+    if (!res.headersSent) {
+      res.status(500).send(`Server Download Error: ${err?.message || 'Process error'}`);
+    }
   });
 });
 
@@ -395,4 +379,5 @@ app.listen(PORT, () => {
   console.log(`✅ Green Hole Downloader Backend running on port ${PORT}`);
   console.log(`🔧 yt-dlp path: ${YTDLP_PATH}`);
   console.log(`🎬 ffmpeg path: ${FFMPEG_PATH}`);
+  console.log(`🍪 Cookies file active: ${fs.existsSync(COOKIES_PATH)}`);
 });
