@@ -72,12 +72,13 @@ function ensureBinariesPermissions() {
 }
 ensureBinariesPermissions();
 
-// Base args — android_creator handles YouTube anti-bot natively with zero cookies required!
+// Base args — --js-runtimes node enables Node.js challenge solver for YouTube JS anti-bot!
 const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--no-check-certificates',
-  '--extractor-args', 'youtube:player_client=android_creator,android',
+  '--js-runtimes', 'node',
+  '--extractor-args', 'youtube:player_client=android_creator,android,web',
 ];
 
 if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
@@ -149,7 +150,6 @@ app.post('/api/parse', async (req, res) => {
 
     let platform = 'video';
     if (cleanUrl.includes('youtube.com') || cleanUrl.includes('youtu.be')) platform = 'youtube';
-    else if (cleanUrl.includes('tiktok.com')) platform = 'tiktok';
     else if (cleanUrl.includes('instagram.com')) platform = 'instagram';
     else if (cleanUrl.includes('facebook.com') || cleanUrl.includes('fb.watch')) platform = 'facebook';
 
@@ -158,24 +158,9 @@ app.post('/api/parse', async (req, res) => {
     let author = `@${platform}_creator`;
     let duration = '03:15';
 
-    // TikTok: Use TikWM API
-    if (platform === 'tiktok') {
-      try {
-        const tikRes = await axios.get(`https://www.tikwm.com/api/?url=${encodeURIComponent(cleanUrl)}`, { timeout: 8000 });
-        if (tikRes.data && tikRes.data.data) {
-          const d = tikRes.data.data;
-          title = d.title || title;
-          thumbnail = d.cover || d.origin_cover || thumbnail;
-          author = d.author ? `@${d.author.unique_id || d.author.nickname}` : author;
-          duration = formatSeconds(d.duration || 30);
-        }
-      } catch (ttErr) {
-        console.warn('[TikTok parse warning]:', ttErr.message);
-      }
-    } else {
-      // YouTube/Instagram/Facebook: use yt-dlp
-      const info = await getYtDlpInfo(cleanUrl);
-      if (info) {
+    // YouTube/Instagram/Facebook: use yt-dlp
+    const info = await getYtDlpInfo(cleanUrl);
+    if (info) {
         title = info.title || title;
         thumbnail = info.thumbnail || thumbnail;
         author = info.uploader ? `@${info.uploader}` : (info.channel ? `@${info.channel}` : author);
@@ -193,7 +178,6 @@ app.post('/api/parse', async (req, res) => {
           console.warn('[oEmbed fallback warning]:', e.message);
         }
       }
-    }
 
     const cleanTitle = title.replace(/[^\w\s.-]/g, '_').substring(0, 80);
 
@@ -305,40 +289,6 @@ app.get('/api/download', async (req, res) => {
   const safeFilename = rawFilename.replace(/[^\w\s.-]/g, '_').substring(0, 100);
   console.log(`[Streamer Request] URL: ${videoUrl} | Quality: ${quality} | Audio: ${isAudio}`);
 
-  // TIKTOK: Direct TikWM CDN streaming
-  if (videoUrl.includes('tiktok.com')) {
-    try {
-      const tikRes = await axios.get(`https://www.tikwm.com/api/?url=${encodeURIComponent(videoUrl)}`, { timeout: 10000 });
-      if (tikRes.data && tikRes.data.data) {
-        const d = tikRes.data.data;
-        let mediaUrl = isAudio ? d.music : (d.hdplay || d.play);
-
-        if (mediaUrl) {
-          if (!mediaUrl.startsWith('http')) {
-            mediaUrl = 'https://www.tikwm.com' + mediaUrl;
-          }
-          console.log(`[TikTok CDN] Streaming directly: ${mediaUrl}`);
-          const streamRes = await axios({
-            method: 'get',
-            url: mediaUrl,
-            responseType: 'stream',
-            timeout: 60000,
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
-          });
-          res.setHeader('Content-Disposition', `attachment; filename="${safeFilename}"`);
-          res.setHeader('Content-Type', isAudio ? 'audio/mpeg' : 'video/mp4');
-          if (streamRes.headers['content-length']) {
-            res.setHeader('Content-Length', streamRes.headers['content-length']);
-          }
-          return streamRes.data.pipe(res);
-        }
-      }
-    } catch (tikErr) {
-      console.warn('[TikTok stream warning]:', tikErr.message);
-    }
-  }
 
   // Ensure binaries exist & permissions set on Linux
   if (!fs.existsSync(YTDLP_PATH) && process.platform !== 'win32') {
