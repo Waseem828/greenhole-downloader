@@ -72,18 +72,13 @@ function ensureBinariesPermissions() {
 }
 ensureBinariesPermissions();
 
-// Base args with automatic cookies.txt detection!
+// Base args — android_creator handles YouTube anti-bot natively with zero cookies required!
 const YTDLP_BASE_ARGS = [
   '--no-playlist',
   '--no-warnings',
   '--no-check-certificates',
   '--extractor-args', 'youtube:player_client=android_creator,android',
 ];
-
-if (fs.existsSync(COOKIES_PATH)) {
-  console.log('🍪 cookies.txt detected! Using session cookies for YouTube bypass...');
-  YTDLP_BASE_ARGS.push('--cookies', COOKIES_PATH);
-}
 
 if (FFMPEG_PATH && fs.existsSync(FFMPEG_PATH)) {
   YTDLP_BASE_ARGS.push('--ffmpeg-location', FFMPEG_PATH);
